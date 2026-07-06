@@ -1,0 +1,22 @@
+# Loan verification portal — docker-compose on an internal prod VM (matches the
+# chat-export-service / amul-oan-api dev pattern). Internal-only, no public route.
+#   web : the password-gated verify + redeem UI (always up)
+services:
+  web:
+    build: .
+    image: amul-loan-portal:latest
+    container_name: loan-portal-web
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${WEB_PORT:-8085}:8000"
+    networks:
+      - amul-network
+
+# Shared external network used by the other amul services (amul-oan-api etc.),
+# so the portal can reach the amul_loan Postgres over the compose network if the
+# DB runs there. If the amul_loan DB is reached by host IP (10.5.25.x) instead,
+# this network is harmless. Create it once with:  docker network create amul-network
+networks:
+  amul-network:
+    external: true
