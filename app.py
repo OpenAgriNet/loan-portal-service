@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html as _html
 import hmac
 import io
 import json
@@ -398,6 +399,24 @@ _SAMPLE_HEADERS = [_FIELD_TO_HEADER[f].upper() for f in _SAMPLE_FIELD_ORDER]
 # the Instructions sheet both say to delete it — it would otherwise upsert as a
 # real eligible farmer.
 _SAMPLE_ROWS = [["1042", "30112345678", "EXAMPLE ROW - DELETE ME", 8567.50, "BORIYA", "9876543210"]]
+# One description per field, rendered in THREE places: hover tooltips on the admin
+# page, hover comments on the template's header cells, and the Instructions sheet.
+# Keep them factual about what the parser actually does with each column.
+_FIELD_DESCRIPTIONS = {
+    "farmer_code": "Society membership (sabhsad) code from the SABHSAD export. "
+                   "Fill this in: rows are matched on (MOBILE NO + CODE), so a blank code "
+                   "means re-uploading the same file adds duplicate rows instead of updating.",
+    "ac_no": "Bank account number as printed on the export. Stored as text, so leading zeros "
+             "are kept. Informational only.",
+    "sabhsad_name": "Farmer's name as registered with the milk society. Shown in the "
+                    "eligibility list on this page.",
+    "milk_payment_amount": "Rupees paid to the farmer for milk in the export's cycle. "
+                           "Informational only — the loan flow does not read it. Digits only: "
+                           "no currency symbol, and any text is stored as blank without warning.",
+    "mandali_name": "Village milk society the farmer pours to. Informational only.",
+    "phone": "Required. The farmer's mobile, matched on the last 10 digits — a +91 or 0 prefix "
+             "is fine. Anything shorter than 10 digits is skipped and the row is not loaded.",
+}
 _SAMPLE_NOTES = [
     "How to fill this sheet",
     "",
@@ -405,12 +424,14 @@ _SAMPLE_NOTES = [
     "   A renamed header (e.g. NAME instead of SABHSAD NAME) is IGNORED SILENTLY and",
     "   that column loads blank for every row.",
     "2. Delete the example row on the first sheet before uploading.",
-    "3. MOBILE NO is required — rows with fewer than 10 digits are skipped.",
-    "4. CODE should be filled. Rows upsert on (MOBILE NO, CODE); a blank CODE means",
-    "   re-uploading the same file ADDS DUPLICATE ROWS instead of updating them.",
-    "5. MILK PAYMENT AMOUNT: plain digits only, no currency symbol. Non-numeric text",
-    "   is stored as blank without warning.",
-    "6. Only the first sheet is read. This Instructions sheet is ignored.",
+    "3. Only the first sheet is read. This Instructions sheet is ignored.",
+    "4. Hover any header cell on the first sheet to see the same notes as below.",
+    "",
+    "What each column means",
+    "",
+]
+_SAMPLE_NOTES += [
+    f"{_FIELD_TO_HEADER[f].upper()} — {_FIELD_DESCRIPTIONS[f]}" for f in _SAMPLE_FIELD_ORDER
 ]
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -426,8 +447,14 @@ def _build_sample_xlsx() -> bytes:
     ws.append(_SAMPLE_HEADERS)
     for row in _SAMPLE_ROWS:
         ws.append(row)
-    for i, header in enumerate(_SAMPLE_HEADERS, start=1):
-        ws.cell(row=1, column=i).font = openpyxl.styles.Font(bold=True)
+    for i, (header, field) in enumerate(zip(_SAMPLE_HEADERS, _SAMPLE_FIELD_ORDER), start=1):
+        cell = ws.cell(row=1, column=i)
+        cell.font = openpyxl.styles.Font(bold=True)
+        # Excel/LibreOffice show this on hover. Comments are not cell values, so the
+        # parser (values_only) never sees them.
+        cell.comment = openpyxl.comments.Comment(
+            f"{header}\n\n{_FIELD_DESCRIPTIONS[field]}", "Amul Loan Portal", height=140, width=300
+        )
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = max(14, len(header) + 4)
     notes = wb.create_sheet("Instructions")
     for line in _SAMPLE_NOTES:
@@ -1355,7 +1382,41 @@ function doExport(ev){
 # =======================================================================
 # Admin UI (server-rendered; reuses the portal STYLE/logo + a little extra CSS)
 # =======================================================================
+def _tip_attrs(field: str) -> str:
+    """data-tip + aria-label for one field, escaped for an HTML attribute."""
+    d = _html.escape(_FIELD_DESCRIPTIONS[field], quote=True)
+    return f'tabindex="0" data-tip="{d}" aria-label="{d}"'
+
+
+# Column chips for the upload card — same order and names as the template.
+COL_CHIPS_HTML = "".join(
+    f'<span class="col-chip tip{" req" if f == "phone" else ""}" {_tip_attrs(f)}>'
+    f'{_FIELD_TO_HEADER[f].upper()}</span>'
+    for f in _SAMPLE_FIELD_ORDER
+)
+
+
 ADMIN_STYLE = """
+/* Hover/focus tooltip. Pure CSS: the text lives in data-tip, mirrored into
+   aria-label so it is not mouse-only. */
+.tip{position:relative;cursor:help}
+.tip::after{content:attr(data-tip);position:absolute;left:0;top:calc(100% + .35rem);z-index:30;
+  width:max-content;max-width:19rem;white-space:normal;padding:.5rem .6rem;
+  border-radius:var(--radius-md);background:var(--gray-900);color:#fff;
+  font-size:.75rem;line-height:1.4;font-weight:400;text-transform:none;letter-spacing:0;
+  box-shadow:0 6px 16px rgba(0,0,0,.18);opacity:0;visibility:hidden;transition:opacity .12s ease}
+.tip:hover::after,.tip:focus-visible::after{opacity:1;visibility:visible}
+.tip:last-child::after,.col-chip:nth-child(n+5)::after{left:auto;right:0}
+.col-list{display:flex;flex-wrap:wrap;gap:.35rem;margin:.5rem 0 .25rem}
+.col-chip{font-size:.68rem;font-weight:600;letter-spacing:.03em;background:var(--muted);
+  color:var(--gray-600);padding:.25rem .55rem;border-radius:999px;border:1px dashed var(--border)}
+.col-chip.req{background:var(--primary-tint);color:var(--brand-red);border-style:solid}
+.qa-field{display:flex;flex-direction:column;gap:.25rem}
+/* .input is flex:1 1 220px — in this COLUMN flex the basis would apply to height
+   and stretch the box to 220px, so opt the field inputs out of flexing. */
+.qa-field .input{flex:none}
+.qa-cap{font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  color:var(--muted-foreground);width:max-content}
 .qa-grid{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
 @media(max-width:520px){.qa-grid{grid-template-columns:1fr}}
 .section-title{font-size:1rem;font-weight:600;margin:0 0 .25rem}
@@ -1426,11 +1487,11 @@ def render_admin() -> str:
 
     <section class="card">
       <h2 class="section-title">Add eligible people (upload)</h2>
-      <p class="hint">Upload a SABHSAD <strong>.csv</strong> or <strong>.xlsx</strong>
-        (columns: CODE, AC NO, SABHSAD NAME, MILK PAYMENT AMOUNT, MANDALI NAME, MOBILE NO).
-        Rows upsert on (phone, farmer&nbsp;code); short/blank phones are skipped.
-        <br><strong>Headers must match exactly</strong> — a renamed column is ignored and
-        loads blank. Start from the
+      <p class="hint">Upload a SABHSAD <strong>.csv</strong> or <strong>.xlsx</strong> with these
+        columns — <strong>headers must match exactly</strong>, a renamed column is ignored and
+        loads blank. Hover a column for what it means.</p>
+      <div class="col-list">{COL_CHIPS_HTML}</div>
+      <p class="hint">Start from the
         <a href="/admin/eligibility/sample.xlsx" download>sample sheet</a>
         and delete its example row before uploading.</p>
       <form id="uploadForm" onsubmit="return doUpload(event)">
@@ -1449,10 +1510,14 @@ def render_admin() -> str:
         Phone is required; the rest are optional.</p>
       <form id="quickAddForm" onsubmit="return doQuickAdd(event)">
         <div class="qa-grid">
-          <input class="input" id="qaPhone" inputmode="numeric" autocomplete="off" placeholder="10-digit mobile *" required>
-          <input class="input" id="qaName" autocomplete="off" placeholder="Name (optional)">
-          <input class="input" id="qaCode" autocomplete="off" placeholder="Farmer code (optional)">
-          <input class="input" id="qaMandali" autocomplete="off" placeholder="Mandali (optional)">
+          <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("phone")}>Mobile *</span>
+            <input class="input" id="qaPhone" inputmode="numeric" autocomplete="off" placeholder="10-digit mobile *" required></label>
+          <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("sabhsad_name")}>Name</span>
+            <input class="input" id="qaName" autocomplete="off" placeholder="Name (optional)"></label>
+          <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("farmer_code")}>Farmer code</span>
+            <input class="input" id="qaCode" autocomplete="off" placeholder="Farmer code (optional)"></label>
+          <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("mandali_name")}>Mandali</span>
+            <input class="input" id="qaMandali" autocomplete="off" placeholder="Mandali (optional)"></label>
         </div>
         <div style="margin-top:.75rem"><button class="btn btn-primary" type="submit">Add number</button></div>
       </form>
