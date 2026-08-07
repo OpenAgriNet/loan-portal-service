@@ -385,6 +385,59 @@ def _parse_eligibility_bytes(
     return rows, skipped
 
 
+# Template offered by the admin UI. Headers are DERIVED from _SABHSAD_HEADER_MAP
+# (reversed) so the download can never drift from what the parser accepts — the
+# blank-column reports trace back to hand-made files with renamed headers, which
+# only `phone`/`farmer_code` are strict enough to reject.
+_FIELD_TO_HEADER = {v: k for k, v in _SABHSAD_HEADER_MAP.items()}
+_SAMPLE_FIELD_ORDER = (
+    "farmer_code", "ac_no", "sabhsad_name", "milk_payment_amount", "mandali_name", "phone",
+)
+_SAMPLE_HEADERS = [_FIELD_TO_HEADER[f].upper() for f in _SAMPLE_FIELD_ORDER]
+# One example row: realistic formatting, obviously-fake identity. The UI hint and
+# the Instructions sheet both say to delete it — it would otherwise upsert as a
+# real eligible farmer.
+_SAMPLE_ROWS = [["1042", "30112345678", "EXAMPLE ROW - DELETE ME", 8567.50, "BORIYA", "9876543210"]]
+_SAMPLE_NOTES = [
+    "How to fill this sheet",
+    "",
+    "1. Keep row 1 exactly as-is. Column headers are matched by name, not position.",
+    "   A renamed header (e.g. NAME instead of SABHSAD NAME) is IGNORED SILENTLY and",
+    "   that column loads blank for every row.",
+    "2. Delete the example row on the first sheet before uploading.",
+    "3. MOBILE NO is required — rows with fewer than 10 digits are skipped.",
+    "4. CODE should be filled. Rows upsert on (MOBILE NO, CODE); a blank CODE means",
+    "   re-uploading the same file ADDS DUPLICATE ROWS instead of updating them.",
+    "5. MILK PAYMENT AMOUNT: plain digits only, no currency symbol. Non-numeric text",
+    "   is stored as blank without warning.",
+    "6. Only the first sheet is read. This Instructions sheet is ignored.",
+]
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _build_sample_xlsx() -> bytes:
+    """Render the eligibility template workbook. Sheet 1 is the upload sheet;
+    Instructions is a second sheet, which the parser never reads."""
+    import openpyxl  # lazy: mirrors _read_xlsx_rows
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "SABHSAD"
+    ws.append(_SAMPLE_HEADERS)
+    for row in _SAMPLE_ROWS:
+        ws.append(row)
+    for i, header in enumerate(_SAMPLE_HEADERS, start=1):
+        ws.cell(row=1, column=i).font = openpyxl.styles.Font(bold=True)
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = max(14, len(header) + 4)
+    notes = wb.create_sheet("Instructions")
+    for line in _SAMPLE_NOTES:
+        notes.append([line])
+    notes.column_dimensions["A"].width = 90
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # Upsert on (phone, farmer_code); flips is_active back to true on re-add.
 _ELIG_UPSERT_SQL = (
     "INSERT INTO loan_eligibility_list "
@@ -833,6 +886,17 @@ async def admin_eligibility_upload(
         "skipped": len(skipped),
         "skipped_detail": skipped[:50],
     }
+
+
+# ---------------- eligibility: download the blank template ----------------
+@app.get("/admin/eligibility/sample.xlsx")
+def admin_eligibility_sample(request: Request):
+    _require_admin(request)
+    return Response(
+        content=_build_sample_xlsx(),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": 'attachment; filename="sabhsad_eligibility_template.xlsx"'},
+    )
 
 
 # ---------------- eligibility: quick add a single number ----------------
@@ -1364,7 +1428,11 @@ def render_admin() -> str:
       <h2 class="section-title">Add eligible people (upload)</h2>
       <p class="hint">Upload a SABHSAD <strong>.csv</strong> or <strong>.xlsx</strong>
         (columns: CODE, AC NO, SABHSAD NAME, MILK PAYMENT AMOUNT, MANDALI NAME, MOBILE NO).
-        Rows upsert on (phone, farmer&nbsp;code); short/blank phones are skipped.</p>
+        Rows upsert on (phone, farmer&nbsp;code); short/blank phones are skipped.
+        <br><strong>Headers must match exactly</strong> — a renamed column is ignored and
+        loads blank. Start from the
+        <a href="/admin/eligibility/sample.xlsx" download>sample sheet</a>
+        and delete its example row before uploading.</p>
       <form id="uploadForm" onsubmit="return doUpload(event)">
         <div class="file-row">
           <input type="file" id="upFile" accept=".csv,.xlsx" required>
