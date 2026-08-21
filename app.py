@@ -30,7 +30,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, Query, Request, HTTPException, UploadFile
@@ -73,6 +73,14 @@ ADMIN_SCOPE = "admin"  # signed into the admin cookie's HMAC payload; NOT in ver
 ADMIN_ACTOR = os.environ.get("ADMIN_ACTOR", "admin:shared")
 # Cap for uploaded eligibility files (default 5 MiB) — guards memory + abuse.
 ADMIN_UPLOAD_MAX_BYTES = int(os.environ.get("ADMIN_UPLOAD_MAX_BYTES", str(5 * 1024 * 1024)))
+# Optional ceiling on the per-farmer eligible amount (AMUL-51). Unset = no check:
+# the bank's sheet is taken at its word. Set it and any row asking for more is
+# REJECTED at import and named in the skipped list, so a stray zero or a
+# misplaced decimal cannot quietly become an approved loan. The check lives here,
+# at the point the number enters the system — the backends read whatever the
+# eligibility row says and have no opinion about a ceiling.
+_max_amt = (os.environ.get("MAX_LOAN_AMOUNT_LIMIT") or "").strip()
+MAX_LOAN_AMOUNT_LIMIT = float(_max_amt) if _max_amt else None
 
 # Rate-limit knobs for the code endpoint (mobile lookups are looser).
 CODE_LOOKUPS_PER_SESSION = int(os.environ.get("CODE_LOOKUPS_PER_SESSION", "5"))
@@ -292,6 +300,7 @@ _SABHSAD_HEADER_MAP = {
     "milk payment amount": "milk_payment_amount",
     "mandali name": "mandali_name",
     "mobile no": "phone",
+    "max loan amount": "max_loan_amount",
 }
 
 
@@ -322,6 +331,31 @@ def _num_str(value: Any) -> Optional[str]:
     except ValueError:
         return None
     return s
+
+
+def _coerce_max_loan_amount(value: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validate a per-farmer loan amount. Returns ``(value, None)`` on success —
+    where value is a numeric string for CAST, or None for "left blank" — and
+    ``(None, reason)`` when the cell is unusable.
+
+    Blank is legitimate and means "give this farmer the standard amount": the
+    backends fall back to LOAN_MAX_AMOUNT on a NULL. Everything else is rejected
+    rather than coerced, because this number is what the farmer is offered and
+    what their approval SMS quotes; a silently-dropped decimal point is a wrong
+    loan, not a cosmetic defect. Shared by the upload and the quick-add so the
+    two entry points cannot drift on what they accept."""
+    num = _num_str(value)
+    if num is None:
+        if _clean_cell(value) is not None:
+            return None, f"max loan amount is not a number: {_clean_cell(value)!r}"
+        return None, None
+    amount = float(num)
+    if amount <= 0:
+        return None, f"max loan amount must be greater than 0 (got {amount:g})"
+    if MAX_LOAN_AMOUNT_LIMIT is not None and amount > MAX_LOAN_AMOUNT_LIMIT:
+        return None, (f"max loan amount {amount:g} is above the configured limit "
+                      f"{MAX_LOAN_AMOUNT_LIMIT:g}")
+    return num, None
 
 
 def _read_csv_rows(data: bytes) -> list[list]:
@@ -374,6 +408,10 @@ def _parse_eligibility_bytes(
         if not phone:
             skipped.append({"row": n, "reason": "missing or short phone (need >=10 digits)"})
             continue
+        max_loan, bad_amount = _coerce_max_loan_amount(_at(r, "max_loan_amount"))
+        if bad_amount:
+            skipped.append({"row": n, "reason": bad_amount})
+            continue
         rows.append({
             "phone": phone,
             "farmer_code": _clean_cell(_at(r, "farmer_code")),
@@ -381,6 +419,7 @@ def _parse_eligibility_bytes(
             "sabhsad_name": _clean_cell(_at(r, "sabhsad_name")),
             "ac_no": _clean_cell(_at(r, "ac_no")),
             "milk_payment_amount": _num_str(_at(r, "milk_payment_amount")),
+            "max_loan_amount": max_loan,
             "source_batch": source_batch,
         })
     return rows, skipped
@@ -393,12 +432,13 @@ def _parse_eligibility_bytes(
 _FIELD_TO_HEADER = {v: k for k, v in _SABHSAD_HEADER_MAP.items()}
 _SAMPLE_FIELD_ORDER = (
     "farmer_code", "ac_no", "sabhsad_name", "milk_payment_amount", "mandali_name", "phone",
+    "max_loan_amount",
 )
 _SAMPLE_HEADERS = [_FIELD_TO_HEADER[f].upper() for f in _SAMPLE_FIELD_ORDER]
 # One example row: realistic formatting, obviously-fake identity. The UI hint and
 # the Instructions sheet both say to delete it — it would otherwise upsert as a
 # real eligible farmer.
-_SAMPLE_ROWS = [["1042", "30112345678", "EXAMPLE ROW - DELETE ME", 8567.50, "BORIYA", "9876543210"]]
+_SAMPLE_ROWS = [["1042", "30112345678", "EXAMPLE ROW - DELETE ME", 8567.50, "BORIYA", "9876543210", 5000]]
 # One description per field, rendered in THREE places: hover tooltips on the admin
 # page, hover comments on the template's header cells, and the Instructions sheet.
 # Keep them factual about what the parser actually does with each column.
@@ -416,6 +456,11 @@ _FIELD_DESCRIPTIONS = {
     "mandali_name": "Village milk society the farmer pours to. Informational only.",
     "phone": "Required. The farmer's mobile, matched on the last 10 digits — a +91 or 0 prefix "
              "is fine. Anything shorter than 10 digits is skipped and the row is not loaded.",
+    "max_loan_amount": "The loan this farmer is eligible for, in rupees. THIS IS THE AMOUNT THEY "
+                       "ARE OFFERED and the figure in their approval SMS, so check it. Digits only: "
+                       "no rupee symbol and no commas. Leave it blank to give this farmer the "
+                       "standard amount. A row whose amount is not a number, is zero or negative, "
+                       "or is above the configured limit is rejected and listed after the upload.",
 }
 _SAMPLE_NOTES = [
     "How to fill this sheet",
@@ -469,14 +514,16 @@ def _build_sample_xlsx() -> bytes:
 _ELIG_UPSERT_SQL = (
     "INSERT INTO loan_eligibility_list "
     "(phone, farmer_code, mandali_name, sabhsad_name, ac_no, milk_payment_amount, "
-    " source_batch, is_active) "
+    " max_loan_amount, source_batch, is_active) "
     "VALUES (:phone, :farmer_code, :mandali_name, :sabhsad_name, :ac_no, "
-    " CAST(:milk_payment_amount AS NUMERIC), :source_batch, true) "
+    " CAST(:milk_payment_amount AS NUMERIC), CAST(:max_loan_amount AS NUMERIC), "
+    " :source_batch, true) "
     "ON CONFLICT ON CONSTRAINT uq_loan_eligibility_phone_farmer DO UPDATE SET "
     "  mandali_name = EXCLUDED.mandali_name, "
     "  sabhsad_name = EXCLUDED.sabhsad_name, "
     "  ac_no = EXCLUDED.ac_no, "
     "  milk_payment_amount = EXCLUDED.milk_payment_amount, "
+    "  max_loan_amount = EXCLUDED.max_loan_amount, "
     "  source_batch = EXCLUDED.source_batch, "
     "  is_active = true"
 )
@@ -949,6 +996,10 @@ async def admin_eligibility_add(request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="milk_payment_amount must be a number")
 
+    max_loan, bad_amount = _coerce_max_loan_amount(b.get("max_loan_amount"))
+    if bad_amount:
+        raise HTTPException(status_code=400, detail=bad_amount)
+
     rec = {
         "phone": phone,
         "farmer_code": _c(b.get("farmer_code"), 64),
@@ -956,6 +1007,7 @@ async def admin_eligibility_add(request: Request):
         "sabhsad_name": _c(b.get("sabhsad_name"), 256),
         "ac_no": _c(b.get("ac_no"), 32),
         "milk_payment_amount": milk,
+        "max_loan_amount": max_loan,
         "source_batch": "admin-manual-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
     }
     sm = _get_sessionmaker()
@@ -967,7 +1019,9 @@ async def admin_eligibility_add(request: Request):
             detail={"farmer_code": rec["farmer_code"], "name": rec["sabhsad_name"]},
         )
         await sess.commit()
-    return {"ok": True, "phone": phone, "farmer_code": rec["farmer_code"], "source_batch": rec["source_batch"]}
+    return {"ok": True, "phone": phone, "farmer_code": rec["farmer_code"],
+            "max_loan_amount": float(max_loan) if max_loan is not None else None,
+            "source_batch": rec["source_batch"]}
 
 
 # ---------------- eligibility: search/list ----------------
@@ -982,7 +1036,7 @@ async def admin_eligibility_list(request: Request, q: str = Query("")):
             await sess.execute(
                 text(
                     "SELECT id, phone, farmer_code, mandali_name, sabhsad_name, ac_no, "
-                    "  milk_payment_amount, source_batch, is_active, created_at "
+                    "  milk_payment_amount, max_loan_amount, source_batch, is_active, created_at "
                     "FROM loan_eligibility_list "
                     "WHERE :q = '' OR phone LIKE :like OR sabhsad_name ILIKE :like "
                     "   OR farmer_code ILIKE :like OR mandali_name ILIKE :like "
@@ -1002,6 +1056,7 @@ async def admin_eligibility_list(request: Request, q: str = Query("")):
             "mandali_name": m.get("mandali_name"),
             "ac_no": m.get("ac_no"),
             "milk_payment_amount": float(m["milk_payment_amount"]) if m.get("milk_payment_amount") is not None else None,
+            "max_loan_amount": float(m["max_loan_amount"]) if m.get("max_loan_amount") is not None else None,
             "source_batch": m.get("source_batch"),
             "is_active": m.get("is_active"),
             "created_at": _iso(m.get("created_at")),
@@ -1072,6 +1127,166 @@ async def admin_codes_for_phone(request: Request, phone: str = Query("")):
             "redeemed_by": m.get("redeemed_by"),
         })
     return {"phone": norm, "count": len(out), "codes": out}
+
+
+# ---------------- codes: everyone who has been sent a code -------------------
+# The per-phone lookup above answers "what about THIS farmer". The bank also needs
+# the other direction — who has been sent a code at all, and who has since walked
+# into a branch with it. Both are already in loan_codes; nothing new is recorded.
+_ISSUED_STATUSES = ("active", "redeemed", "cancelled", "expired")
+
+_ISSUED_COLS = (
+    "code, phone, farmer_name, farmer_code, mandali_name, union_code, society_code, "
+    "loan_amount, channel, sms_status, status, issued_at, expires_at, redeemed_at, redeemed_by"
+)
+
+
+def _issued_where(status: str, q: str, d_from, d_to) -> tuple[str, dict]:
+    """Shared WHERE for the issued list and its CSV, so the file always contains
+    exactly the rows the operator was looking at when they pressed Download.
+
+    'expired' is a DERIVED state — a row stays status='active' until the sweep
+    flips it — so it is filtered on the same expires_at test _effective_status
+    applies, and 'active' correspondingly excludes rows that have lapsed."""
+    where = ["1=1"]
+    params: dict = {}
+    if status == "expired":
+        where.append("status = 'active' AND expires_at IS NOT NULL AND expires_at <= now()")
+    elif status == "active":
+        where.append("status = 'active' AND (expires_at IS NULL OR expires_at > now())")
+    elif status in _ISSUED_STATUSES:
+        where.append("status = :status")
+        params["status"] = status
+    if q:
+        where.append("(phone LIKE :like OR code LIKE :like OR farmer_name ILIKE :like "
+                     "OR farmer_code ILIKE :like OR mandali_name ILIKE :like)")
+        params["like"] = f"%{q}%"
+    if d_from is not None:
+        where.append("issued_at >= :d_from")
+        params["d_from"] = d_from
+    if d_to is not None:
+        where.append("issued_at < :d_to")
+        params["d_to"] = d_to
+    return " AND ".join(where), params
+
+
+def _issued_dates(from_: str, to: str):
+    """Parse the optional issued-on range. `to` is INCLUSIVE of its whole day: an
+    operator picking today expects today's codes, not everything before midnight."""
+    try:
+        d_from = datetime.fromisoformat(from_) if from_ else None
+        d_to = (datetime.fromisoformat(to) + timedelta(days=1)) if to else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="from/to must be ISO dates (YYYY-MM-DD)")
+    return d_from, d_to
+
+
+@app.get("/admin/api/issued")
+async def admin_issued_list(
+    request: Request,
+    status: str = Query("all"),
+    q: str = Query(""),
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Farmers who have been sent an approval code, newest first."""
+    _require_admin(request)
+    status = (status or "all").strip().lower()
+    if status not in _ISSUED_STATUSES + ("all",):
+        raise HTTPException(status_code=400, detail=f"status must be one of: all, {', '.join(_ISSUED_STATUSES)}")
+    q = (q or "").strip()
+    d_from, d_to = _issued_dates(from_, to)
+    where, params = _issued_where(status, q, d_from, d_to)
+
+    sm = _get_sessionmaker()
+    async with sm() as sess:
+        total = (await sess.execute(
+            text(f"SELECT count(*) AS n FROM loan_codes WHERE {where}"), params
+        )).scalar_one()
+        rows = (await sess.execute(
+            text(f"SELECT {_ISSUED_COLS} FROM loan_codes WHERE {where} "
+                 "ORDER BY issued_at DESC LIMIT :limit"),
+            {**params, "limit": limit},
+        )).fetchall()
+    out = []
+    for r in rows:
+        m = dict(r._mapping)
+        out.append({
+            "code": m["code"],
+            "phone": m.get("phone"),
+            "farmer_name": m.get("farmer_name"),
+            "farmer_code": m.get("farmer_code"),
+            "mandali_name": m.get("mandali_name"),
+            "loan_amount": float(m["loan_amount"]) if m.get("loan_amount") is not None else None,
+            "channel": m.get("channel"),
+            "sms_status": m.get("sms_status"),
+            "status": m.get("status"),
+            "effective_status": _effective_status(m["status"], m.get("expires_at")),
+            "issued_at": _iso(m.get("issued_at")),
+            "expires_at": _iso(m.get("expires_at")),
+            "redeemed_at": _iso(m.get("redeemed_at")),
+            "redeemed_by": m.get("redeemed_by"),
+        })
+    # `total` is the size of the filtered set; `count` is what came back under the
+    # limit. Surfacing both is what stops a truncated page reading as "that's all".
+    return {"count": len(out), "total": total, "limit": limit, "rows": out}
+
+
+@app.get("/admin/issued.csv")
+async def admin_issued_csv(
+    request: Request,
+    status: str = Query("all"),
+    q: str = Query(""),
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+):
+    """The same list as a CSV. Unlike the on-screen table this is NOT capped — the
+    point of the download is reconciliation, which a silent top-200 would corrupt."""
+    _require_admin(request)
+    status = (status or "all").strip().lower()
+    if status not in _ISSUED_STATUSES + ("all",):
+        raise HTTPException(status_code=400, detail=f"status must be one of: all, {', '.join(_ISSUED_STATUSES)}")
+    q = (q or "").strip()
+    d_from, d_to = _issued_dates(from_, to)
+    where, params = _issued_where(status, q, d_from, d_to)
+
+    sm = _get_sessionmaker()
+    async with sm() as sess:
+        rows = (await sess.execute(
+            text(f"SELECT {_ISSUED_COLS} FROM loan_codes WHERE {where} ORDER BY issued_at DESC"),
+            params,
+        )).fetchall()
+        # This export carries full phone numbers off the platform, so it is audited
+        # like the bank-portal export is.
+        await _audit(
+            sess, actor=ADMIN_ACTOR, action="admin_export", result="ok",
+            src_ip=_client_ip(request),
+            detail={"status": status, "q": q, "from": from_, "to": to, "count": len(rows)},
+        )
+        await sess.commit()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["code", "phone", "farmer_name", "farmer_code", "mandali_name", "union_code",
+                "society_code", "loan_amount", "channel", "sms_status", "status",
+                "effective_status", "issued_at", "expires_at", "redeemed_at", "redeemed_by"])
+    for r in rows:
+        m = dict(r._mapping)
+        w.writerow([
+            m["code"], m.get("phone"), m.get("farmer_name"), m.get("farmer_code"),
+            m.get("mandali_name"), m.get("union_code"), m.get("society_code"),
+            m.get("loan_amount"), m.get("channel"), m.get("sms_status"), m.get("status"),
+            _effective_status(m["status"], m.get("expires_at")), _iso(m.get("issued_at")),
+            _iso(m.get("expires_at")), _iso(m.get("redeemed_at")), m.get("redeemed_by"),
+        ])
+    span = f"_{from_}_to_{to}" if (from_ or to) else ""
+    filename = f"loan_codes_{status}{span}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------- codes: clear/cancel active (lets farmer regenerate) --------
@@ -1388,6 +1603,17 @@ def _tip_attrs(field: str) -> str:
     return f'tabindex="0" data-tip="{d}" aria-label="{d}"'
 
 
+# How many issued codes the on-screen table shows. The CSV is deliberately not
+# capped — see admin_issued_csv.
+_ISSUED_PAGE = 200
+# The quick-add placeholder states the configured ceiling when there is one, so an
+# operator finds out about the limit before the row is rejected, not after.
+_MAX_LOAN_PLACEHOLDER = (
+    f"Blank = standard amount (max {MAX_LOAN_AMOUNT_LIMIT:g})"
+    if MAX_LOAN_AMOUNT_LIMIT is not None else "Blank = standard amount"
+)
+
+
 # Column chips for the upload card — same order and names as the template.
 COL_CHIPS_HTML = "".join(
     f'<span class="col-chip tip{" req" if f == "phone" else ""}" {_tip_attrs(f)}>'
@@ -1518,6 +1744,9 @@ def render_admin() -> str:
             <input class="input" id="qaCode" autocomplete="off" placeholder="Farmer code (optional)"></label>
           <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("mandali_name")}>Mandali</span>
             <input class="input" id="qaMandali" autocomplete="off" placeholder="Mandali (optional)"></label>
+          <label class="qa-field"><span class="qa-cap tip" {_tip_attrs("max_loan_amount")}>Max loan amount</span>
+            <input class="input" id="qaMaxLoan" inputmode="numeric" autocomplete="off"
+              placeholder="{_MAX_LOAN_PLACEHOLDER}"></label>
         </div>
         <div style="margin-top:.75rem"><button class="btn btn-primary" type="submit">Add number</button></div>
       </form>
@@ -1532,8 +1761,39 @@ def render_admin() -> str:
         <button class="btn btn-outline" type="submit">Search</button>
       </form>
       <div class="table-wrap"><table class="tbl" id="eligTbl">
-        <thead><tr><th>Name</th><th>Phone</th><th>Farmer code</th><th>Mandali</th><th>Batch</th><th>Active</th><th></th></tr></thead>
-        <tbody id="eligBody"><tr><td colspan="7" class="empty">Search to list eligible people.</td></tr></tbody>
+        <thead><tr><th>Name</th><th>Phone</th><th>Farmer code</th><th>Mandali</th>
+          <th class="tip" {_tip_attrs("max_loan_amount")}>Max loan</th><th>Batch</th><th>Active</th><th></th></tr></thead>
+        <tbody id="eligBody"><tr><td colspan="8" class="empty">Search to list eligible people.</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section class="card">
+      <h2 class="section-title">Farmers sent an approval code</h2>
+      <p class="hint">Everyone who has been issued a code, newest first.
+        <strong>Active</strong> = code sent, not yet presented at a branch.
+        <strong>Issued</strong> = the farmer has redeemed it at the bank.
+        The table shows the latest {_ISSUED_PAGE} matches; the CSV contains every match.</p>
+      <form class="search-row" onsubmit="return doIssuedSearch(event)">
+        <input id="issuedQ" class="input" autocomplete="off" placeholder="Phone, name, code, farmer code or mandali">
+        <select id="issuedStatus" class="input" style="flex:0 1 11rem">
+          <option value="all">All statuses</option>
+          <option value="active">Active (not redeemed)</option>
+          <option value="redeemed">Issued at bank</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="expired">Expired</option>
+        </select>
+        <button class="btn btn-outline" type="submit">Search</button>
+      </form>
+      <div class="file-row">
+        <label class="hint" style="margin:0">Sent from <input type="date" id="issuedFrom"></label>
+        <label class="hint" style="margin:0">to <input type="date" id="issuedTo"></label>
+        <button class="btn btn-outline btn-sm" type="button" onclick="doIssuedExport()">Download CSV</button>
+      </div>
+      <div id="issuedCount" class="hint" style="margin-top:.6rem"></div>
+      <div class="table-wrap"><table class="tbl" id="issuedTbl">
+        <thead><tr><th>Name</th><th>Phone</th><th>Code</th><th>Amount</th><th>Status</th>
+          <th>Mandali</th><th>Channel</th><th>SMS</th><th>Sent</th><th>Redeemed</th></tr></thead>
+        <tbody id="issuedBody"><tr><td colspan="10" class="empty">Search to list farmers who have been sent a code.</td></tr></tbody>
       </table></div>
     </section>
 
@@ -1606,12 +1866,15 @@ async function doQuickAdd(ev){
   var body={ phone:document.getElementById('qaPhone').value.trim(),
     sabhsad_name:document.getElementById('qaName').value.trim(),
     farmer_code:document.getElementById('qaCode').value.trim(),
-    mandali_name:document.getElementById('qaMandali').value.trim() };
+    mandali_name:document.getElementById('qaMandali').value.trim(),
+    max_loan_amount:document.getElementById('qaMaxLoan').value.trim() };
   try{
     var r=await fetch('/admin/eligibility/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var data=await r.json();
     if(!r.ok){ showMsg(data.detail||'Add failed.','error'); return false; }
-    showMsg('Added '+data.phone+(data.farmer_code?(' ('+esc(data.farmer_code)+')'):'')+' to the eligibility list.','ok');
+    showMsg('Added '+data.phone+(data.farmer_code?(' ('+esc(data.farmer_code)+')'):'')
+      +' to the eligibility list'
+      +(data.max_loan_amount!=null?(' for '+money(data.max_loan_amount)):' at the standard amount')+'.','ok');
     document.getElementById('quickAddForm').reset();
     doEligSearch(null);
   }catch(e){ showMsg('Network error.','error'); }
@@ -1626,13 +1889,14 @@ async function doEligSearch(ev){
     var r=await fetch('/admin/api/eligibility?q='+encodeURIComponent(q),{headers:{'Accept':'application/json'}});
     var data=await r.json();
     if(!r.ok){ showMsg(data.detail||'Search failed.','error'); return false; }
-    if(!data.rows.length){ body.innerHTML='<tr><td colspan="7" class="empty">No matching people.</td></tr>'; return false; }
+    if(!data.rows.length){ body.innerHTML='<tr><td colspan="8" class="empty">No matching people.</td></tr>'; return false; }
     body.innerHTML=data.rows.map(function(x){
       return '<tr>'
         + '<td>'+(esc(x.sabhsad_name)||'—')+'</td>'
         + '<td class="mono">'+esc(x.phone)+'</td>'
         + '<td>'+(esc(x.farmer_code)||'—')+'</td>'
         + '<td>'+(esc(x.mandali_name)||'—')+'</td>'
+        + '<td>'+(x.max_loan_amount!=null?money(x.max_loan_amount):'<span class="pill-inactive">standard</span>')+'</td>'
         + '<td>'+(esc(x.source_batch)||'—')+'</td>'
         + '<td>'+(x.is_active?'yes':'<span class="pill-inactive">no</span>')+'</td>'
         + '<td><button class="btn btn-danger btn-sm" onclick="removeElig(\''+esc(x.phone)+'\',\''+esc(x.sabhsad_name||'')+'\')">Remove</button></td>'
@@ -1651,6 +1915,59 @@ async function removeElig(phone, name){
     showMsg('Removed '+data.deleted+' row(s) for '+phone+'.', data.deleted?'ok':'info');
     doEligSearch(null);
   }catch(e){ showMsg('Network error.','error'); }
+}
+
+function issuedQuery(){
+  var p=new URLSearchParams();
+  var q=document.getElementById('issuedQ').value.trim();
+  var st=document.getElementById('issuedStatus').value;
+  var f=document.getElementById('issuedFrom').value, t=document.getElementById('issuedTo').value;
+  if(q) p.set('q',q);
+  if(st && st!=='all') p.set('status',st);
+  if(f) p.set('from',f);
+  if(t) p.set('to',t);
+  return p;
+}
+
+async function doIssuedSearch(ev){
+  if(ev) ev.preventDefault();
+  showMsg('','info');
+  var body=document.getElementById('issuedBody');
+  var countEl=document.getElementById('issuedCount');
+  try{
+    var r=await fetch('/admin/api/issued?'+issuedQuery().toString(),{headers:{'Accept':'application/json'}});
+    var data=await r.json();
+    if(!r.ok){ showMsg(data.detail||'Search failed.','error'); return false; }
+    if(!data.rows.length){
+      countEl.textContent='';
+      body.innerHTML='<tr><td colspan="10" class="empty">No farmer has been sent a code matching this.</td></tr>';
+      return false;
+    }
+    // Say plainly when the table is a truncated view, so a partial page is never
+    // mistaken for the whole set.
+    countEl.textContent = data.total>data.count
+      ? ('Showing '+data.count+' of '+data.total+' — narrow the search or download the CSV for all of them.')
+      : (data.total+' farmer'+(data.total===1?'':'s')+' sent a code.');
+    body.innerHTML=data.rows.map(function(c){
+      return '<tr>'
+        + '<td>'+(esc(c.farmer_name)||'—')+'</td>'
+        + '<td class="mono">'+esc(c.phone)+'</td>'
+        + '<td class="mono">'+esc(c.code)+'</td>'
+        + '<td>'+money(c.loan_amount)+'</td>'
+        + '<td>'+badge(c.effective_status)+'</td>'
+        + '<td>'+(esc(c.mandali_name)||'—')+'</td>'
+        + '<td>'+(esc(c.channel)||'—')+'</td>'
+        + '<td>'+(esc(c.sms_status)||'—')+'</td>'
+        + '<td>'+esc(fmtDate(c.issued_at))+'</td>'
+        + '<td>'+esc(fmtDate(c.redeemed_at))+'</td>'
+        + '</tr>';
+    }).join('');
+  }catch(e){ showMsg('Network error.','error'); }
+  return false;
+}
+
+function doIssuedExport(){
+  window.location='/admin/issued.csv?'+issuedQuery().toString();
 }
 
 async function doCodesLookup(ev){

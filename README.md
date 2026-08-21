@@ -43,6 +43,8 @@ reach it, and an admin session grants no verify/redeem rights (see below).
 | GET  | `/admin/api/eligibility?q=<phone-or-name>` | admin cookie | search/list eligibility rows (≤200) |
 | POST | `/admin/eligibility/remove` | admin cookie | JSON `{phone}` → **hard delete** all of that phone's rows |
 | GET  | `/admin/api/codes?phone=<10d>` | admin cookie | that phone's codes + statuses |
+| GET  | `/admin/api/issued?status=&q=&from=&to=&limit=` | admin cookie | **every** farmer sent a code, newest first |
+| GET  | `/admin/issued.csv?status=&q=&from=&to=` | admin cookie | the same list as CSV (uncapped, audited) |
 | POST | `/admin/codes/clear` | admin cookie | JSON `{phone}` → **cancel** active codes (record kept) |
 
 **Auth separation.** The admin cookie is `admin_session` (verify uses
@@ -64,6 +66,27 @@ Rows with a missing/short phone are **skipped** (not fatal); blank spacer rows a
 ignored. The upload is size-capped (`ADMIN_UPLOAD_MAX_BYTES`, default 5 MiB) and
 sniffed (`.xlsx` must be a `PK…` zip). The response reports
 `{parsed, upserted, skipped, skipped_detail[]}`.
+
+**Per-farmer loan amount.** The sheet carries a `MAX LOAN AMOUNT` column
+(`loan_eligibility_list.max_loan_amount`). It is **the amount the farmer is
+offered in chat/voice and the figure in their approval SMS**, so the parser
+rejects a row whose amount is non-numeric, zero or negative, or above
+`MAX_LOAN_AMOUNT_LIMIT` when that is set — the row is named in `skipped_detail`
+rather than loaded. Blank is legitimate and means "standard amount": it loads as
+NULL and the backends fall back to their `LOAN_MAX_AMOUNT`. Sheets predating the
+column keep loading unchanged. The upload and the quick-add share one validator,
+so a limit cannot be side-stepped by adding a number by hand.
+
+**Who has been sent a code.** `GET /admin/api/issued` lists across all farmers,
+filtered by `status` (`all|active|redeemed|cancelled|expired`), free text `q`
+(phone / code / name / farmer code / mandali), and an inclusive `from`/`to`
+issued-on range. `expired` and `active` are filtered on the *derived* state (a
+lapsed code keeps `status='active'` until the sweep runs), matching
+`effective_status`. The response carries both `count` (rows returned, ≤ `limit`,
+default 200) and `total` (rows matched) so a truncated page is never mistaken for
+the whole set. `GET /admin/issued.csv` returns the same filter **uncapped** —
+truncating a reconciliation file would corrupt it — and writes an
+`action='admin_export'` audit row, since it carries full phone numbers.
 
 **Remove.** `POST /admin/eligibility/remove` hard-deletes every
 `loan_eligibility_list` row for a phone and reports the count.
@@ -138,9 +161,22 @@ UI only ever sees masked phones (e.g. `98••••34`).
 | `ADMIN_PASSWORD` | – (required for admin) | **separate** admin login; distinct from `PORTAL_PASSWORD`. Make it strong. |
 | `ADMIN_ACTOR` | `admin:shared` | audit actor for admin actions |
 | `ADMIN_UPLOAD_MAX_BYTES` | `5242880` | max eligibility upload size (5 MiB) |
+| `MAX_LOAN_AMOUNT_LIMIT` | – (unset) | ceiling on a per-farmer `MAX LOAN AMOUNT`. Unset = no check. Set it and a sheet row above it is rejected at import, so a misplaced decimal cannot become an approved loan. Read at startup — restart after changing. |
 | `LOAN_DB_URL` | – (required) | `postgresql+asyncpg://amul_loan:…@host:5432/amul_loan` |
 | `WEB_PORT` | `8085` | host port |
 | `CODE_LOOKUPS_PER_SESSION` / `CODE_LOOKUPS_PER_IP` / `RATE_WINDOW_MIN` / `NONCE_TTL` | 5 / 20 / 10 / 300 | rate-limit + nonce knobs |
+
+## Tests
+
+There is no CI on this repo — run them yourself before deploying:
+
+```bash
+pip install -r requirements-dev.txt && pytest
+```
+
+They cover the pure logic that decides loan amounts and filters the issued list
+(sheet parsing, the amount validator and its limit, the template round-trip, and
+the issued-code WHERE builder). No Postgres or network needed.
 
 ## Run locally
 
@@ -157,10 +193,16 @@ connects on the first verify/redeem/export call.
 
 ## Deploy
 
-1. Apply the audit migration once against the `amul_loan` DB:
+1. Apply the migrations once against the `amul_loan` DB:
    ```bash
    psql "$LOAN_DB_DSN" -f migrations/002_audit.sql
+   psql "$LOAN_DB_DSN" -f migrations/003_max_loan_amount.sql
    ```
+   `003` is additive and nullable, so apply it **before** rolling out this build
+   and the matching `amul-oan-api` / `voice-oan-api` builds; the running versions
+   ignore the new column. The same DDL also ships as those repos'
+   `migrations/loan/002` — both are `ADD COLUMN IF NOT EXISTS` against the one
+   shared database, so whichever runs first wins and the rest are no-ops.
    (`loan_codes` already exists from `amul-oan-api/migrations/loan/001_init.sql`
    — the portal makes **no** change to it.)
 2. Fill `.env` (keep `COOKIE_SECURE=true`), then:
@@ -180,7 +222,11 @@ network attachment is harmless.
 - Internal-only exposure is the primary control; shared login only acceptable there.
 - 6-digit codes are brute-forceable → mobile lookup promoted, code endpoint hard
   rate-limited, redeem bound to a prior verify via nonce.
-- PII minimization: masked phone in UI, full PII only server-side, never in logs.
+- PII minimization: masked phone in the **bank portal** UI, full PII only
+  server-side, never in logs. The **admin** surface deliberately shows full
+  phones (it manages the eligibility list keyed on them) and `/admin/issued.csv`
+  exports them — that download is audited, and is a reason the admin area needs
+  the IP-allowlist / Keycloak hardening noted below.
 - Cookie: `HttpOnly`, `SameSite=Lax`, `Secure` (toggle `COOKIE_SECURE` for dev),
   short lifetime; set `SESSION_SECRET` so the cookie survives password rotation.
 - **Admin surface is powerful** — bulk eligibility upload/remove and code
