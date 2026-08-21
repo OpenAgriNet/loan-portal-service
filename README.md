@@ -43,6 +43,8 @@ reach it, and an admin session grants no verify/redeem rights (see below).
 | GET  | `/admin/api/eligibility?q=<phone-or-name>` | admin cookie | search/list eligibility rows (≤200) |
 | POST | `/admin/eligibility/remove` | admin cookie | JSON `{phone}` → **hard delete** all of that phone's rows |
 | GET  | `/admin/api/codes?phone=<10d>` | admin cookie | that phone's codes + statuses |
+| GET  | `/admin/api/issued?status=&q=&from=&to=&limit=` | admin cookie | **every** farmer sent a code, newest first |
+| GET  | `/admin/issued.csv?status=&q=&from=&to=` | admin cookie | the same list as CSV (uncapped, audited) |
 | POST | `/admin/codes/clear` | admin cookie | JSON `{phone}` → **cancel** active codes (record kept) |
 
 **Auth separation.** The admin cookie is `admin_session` (verify uses
@@ -74,6 +76,17 @@ rather than loaded. Blank is legitimate and means "standard amount": it loads as
 NULL and the backends fall back to their `LOAN_MAX_AMOUNT`. Sheets predating the
 column keep loading unchanged. The upload and the quick-add share one validator,
 so a limit cannot be side-stepped by adding a number by hand.
+
+**Who has been sent a code.** `GET /admin/api/issued` lists across all farmers,
+filtered by `status` (`all|active|redeemed|cancelled|expired`), free text `q`
+(phone / code / name / farmer code / mandali), and an inclusive `from`/`to`
+issued-on range. `expired` and `active` are filtered on the *derived* state (a
+lapsed code keeps `status='active'` until the sweep runs), matching
+`effective_status`. The response carries both `count` (rows returned, ≤ `limit`,
+default 200) and `total` (rows matched) so a truncated page is never mistaken for
+the whole set. `GET /admin/issued.csv` returns the same filter **uncapped** —
+truncating a reconciliation file would corrupt it — and writes an
+`action='admin_export'` audit row, since it carries full phone numbers.
 
 **Remove.** `POST /admin/eligibility/remove` hard-deletes every
 `loan_eligibility_list` row for a phone and reports the count.
@@ -162,8 +175,8 @@ pip install -r requirements-dev.txt && pytest
 ```
 
 They cover the pure logic that decides loan amounts and filters the issued list
-(sheet parsing, the amount validator and its limit, and the template
-round-trip). No Postgres or network needed.
+(sheet parsing, the amount validator and its limit, the template round-trip, and
+the issued-code WHERE builder). No Postgres or network needed.
 
 ## Run locally
 
@@ -211,7 +224,9 @@ network attachment is harmless.
   rate-limited, redeem bound to a prior verify via nonce.
 - PII minimization: masked phone in the **bank portal** UI, full PII only
   server-side, never in logs. The **admin** surface deliberately shows full
-  phones — it manages the eligibility list keyed on them.
+  phones (it manages the eligibility list keyed on them) and `/admin/issued.csv`
+  exports them — that download is audited, and is a reason the admin area needs
+  the IP-allowlist / Keycloak hardening noted below.
 - Cookie: `HttpOnly`, `SameSite=Lax`, `Secure` (toggle `COOKIE_SECURE` for dev),
   short lifetime; set `SESSION_SECRET` so the cookie survives password rotation.
 - **Admin surface is powerful** — bulk eligibility upload/remove and code

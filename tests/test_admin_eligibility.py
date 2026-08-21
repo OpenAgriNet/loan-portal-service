@@ -141,3 +141,43 @@ class TestTemplate:
         assert "MAX LOAN AMOUNT" in portal._SAMPLE_HEADERS
         note = next(n for n in portal._SAMPLE_NOTES if n.startswith("MAX LOAN AMOUNT"))
         assert "blank" in note.lower()
+
+
+# ── the issued-codes filters ─────────────────────────────────────────────────
+class TestIssuedFilters:
+    def test_expired_is_filtered_on_the_derived_state(self):
+        """A lapsed code stays status='active' until the sweep runs, so filtering on
+        the stored status alone would report it as active — the opposite of true."""
+        where, params = portal._issued_where("expired", "", None, None)
+        assert "status = 'active'" in where and "expires_at <= now()" in where
+        assert params == {}
+
+    def test_active_excludes_codes_that_have_lapsed(self):
+        where, _ = portal._issued_where("active", "", None, None)
+        assert "expires_at IS NULL OR expires_at > now()" in where
+
+    def test_plain_statuses_bind_rather_than_interpolate(self):
+        where, params = portal._issued_where("redeemed", "", None, None)
+        assert "status = :status" in where and params["status"] == "redeemed"
+
+    def test_search_is_bound_not_interpolated(self):
+        """The free-text box reaches SQL — it must arrive as a parameter."""
+        where, params = portal._issued_where("all", "'; DROP TABLE loan_codes; --", None, None)
+        assert "DROP TABLE" not in where
+        assert params["like"] == "%'; DROP TABLE loan_codes; --%"
+
+    def test_all_with_no_filters_matches_everything(self):
+        where, params = portal._issued_where("all", "", None, None)
+        assert where == "1=1" and params == {}
+
+    def test_to_date_covers_the_whole_day(self):
+        """An operator picking today expects today's codes included, not cut off at
+        midnight — so `to` is advanced a day and compared with <."""
+        d_from, d_to = portal._issued_dates("2026-08-01", "2026-08-21")
+        assert d_from.day == 1 and d_to.day == 22
+        where, _ = portal._issued_where("all", "", d_from, d_to)
+        assert "issued_at < :d_to" in where
+
+    def test_bad_dates_are_rejected(self):
+        with pytest.raises(Exception):
+            portal._issued_dates("not-a-date", "")

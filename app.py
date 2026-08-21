@@ -30,7 +30,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, Query, Request, HTTPException, UploadFile
@@ -1129,6 +1129,166 @@ async def admin_codes_for_phone(request: Request, phone: str = Query("")):
     return {"phone": norm, "count": len(out), "codes": out}
 
 
+# ---------------- codes: everyone who has been sent a code -------------------
+# The per-phone lookup above answers "what about THIS farmer". The bank also needs
+# the other direction — who has been sent a code at all, and who has since walked
+# into a branch with it. Both are already in loan_codes; nothing new is recorded.
+_ISSUED_STATUSES = ("active", "redeemed", "cancelled", "expired")
+
+_ISSUED_COLS = (
+    "code, phone, farmer_name, farmer_code, mandali_name, union_code, society_code, "
+    "loan_amount, channel, sms_status, status, issued_at, expires_at, redeemed_at, redeemed_by"
+)
+
+
+def _issued_where(status: str, q: str, d_from, d_to) -> tuple[str, dict]:
+    """Shared WHERE for the issued list and its CSV, so the file always contains
+    exactly the rows the operator was looking at when they pressed Download.
+
+    'expired' is a DERIVED state — a row stays status='active' until the sweep
+    flips it — so it is filtered on the same expires_at test _effective_status
+    applies, and 'active' correspondingly excludes rows that have lapsed."""
+    where = ["1=1"]
+    params: dict = {}
+    if status == "expired":
+        where.append("status = 'active' AND expires_at IS NOT NULL AND expires_at <= now()")
+    elif status == "active":
+        where.append("status = 'active' AND (expires_at IS NULL OR expires_at > now())")
+    elif status in _ISSUED_STATUSES:
+        where.append("status = :status")
+        params["status"] = status
+    if q:
+        where.append("(phone LIKE :like OR code LIKE :like OR farmer_name ILIKE :like "
+                     "OR farmer_code ILIKE :like OR mandali_name ILIKE :like)")
+        params["like"] = f"%{q}%"
+    if d_from is not None:
+        where.append("issued_at >= :d_from")
+        params["d_from"] = d_from
+    if d_to is not None:
+        where.append("issued_at < :d_to")
+        params["d_to"] = d_to
+    return " AND ".join(where), params
+
+
+def _issued_dates(from_: str, to: str):
+    """Parse the optional issued-on range. `to` is INCLUSIVE of its whole day: an
+    operator picking today expects today's codes, not everything before midnight."""
+    try:
+        d_from = datetime.fromisoformat(from_) if from_ else None
+        d_to = (datetime.fromisoformat(to) + timedelta(days=1)) if to else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="from/to must be ISO dates (YYYY-MM-DD)")
+    return d_from, d_to
+
+
+@app.get("/admin/api/issued")
+async def admin_issued_list(
+    request: Request,
+    status: str = Query("all"),
+    q: str = Query(""),
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Farmers who have been sent an approval code, newest first."""
+    _require_admin(request)
+    status = (status or "all").strip().lower()
+    if status not in _ISSUED_STATUSES + ("all",):
+        raise HTTPException(status_code=400, detail=f"status must be one of: all, {', '.join(_ISSUED_STATUSES)}")
+    q = (q or "").strip()
+    d_from, d_to = _issued_dates(from_, to)
+    where, params = _issued_where(status, q, d_from, d_to)
+
+    sm = _get_sessionmaker()
+    async with sm() as sess:
+        total = (await sess.execute(
+            text(f"SELECT count(*) AS n FROM loan_codes WHERE {where}"), params
+        )).scalar_one()
+        rows = (await sess.execute(
+            text(f"SELECT {_ISSUED_COLS} FROM loan_codes WHERE {where} "
+                 "ORDER BY issued_at DESC LIMIT :limit"),
+            {**params, "limit": limit},
+        )).fetchall()
+    out = []
+    for r in rows:
+        m = dict(r._mapping)
+        out.append({
+            "code": m["code"],
+            "phone": m.get("phone"),
+            "farmer_name": m.get("farmer_name"),
+            "farmer_code": m.get("farmer_code"),
+            "mandali_name": m.get("mandali_name"),
+            "loan_amount": float(m["loan_amount"]) if m.get("loan_amount") is not None else None,
+            "channel": m.get("channel"),
+            "sms_status": m.get("sms_status"),
+            "status": m.get("status"),
+            "effective_status": _effective_status(m["status"], m.get("expires_at")),
+            "issued_at": _iso(m.get("issued_at")),
+            "expires_at": _iso(m.get("expires_at")),
+            "redeemed_at": _iso(m.get("redeemed_at")),
+            "redeemed_by": m.get("redeemed_by"),
+        })
+    # `total` is the size of the filtered set; `count` is what came back under the
+    # limit. Surfacing both is what stops a truncated page reading as "that's all".
+    return {"count": len(out), "total": total, "limit": limit, "rows": out}
+
+
+@app.get("/admin/issued.csv")
+async def admin_issued_csv(
+    request: Request,
+    status: str = Query("all"),
+    q: str = Query(""),
+    from_: str = Query("", alias="from"),
+    to: str = Query(""),
+):
+    """The same list as a CSV. Unlike the on-screen table this is NOT capped — the
+    point of the download is reconciliation, which a silent top-200 would corrupt."""
+    _require_admin(request)
+    status = (status or "all").strip().lower()
+    if status not in _ISSUED_STATUSES + ("all",):
+        raise HTTPException(status_code=400, detail=f"status must be one of: all, {', '.join(_ISSUED_STATUSES)}")
+    q = (q or "").strip()
+    d_from, d_to = _issued_dates(from_, to)
+    where, params = _issued_where(status, q, d_from, d_to)
+
+    sm = _get_sessionmaker()
+    async with sm() as sess:
+        rows = (await sess.execute(
+            text(f"SELECT {_ISSUED_COLS} FROM loan_codes WHERE {where} ORDER BY issued_at DESC"),
+            params,
+        )).fetchall()
+        # This export carries full phone numbers off the platform, so it is audited
+        # like the bank-portal export is.
+        await _audit(
+            sess, actor=ADMIN_ACTOR, action="admin_export", result="ok",
+            src_ip=_client_ip(request),
+            detail={"status": status, "q": q, "from": from_, "to": to, "count": len(rows)},
+        )
+        await sess.commit()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["code", "phone", "farmer_name", "farmer_code", "mandali_name", "union_code",
+                "society_code", "loan_amount", "channel", "sms_status", "status",
+                "effective_status", "issued_at", "expires_at", "redeemed_at", "redeemed_by"])
+    for r in rows:
+        m = dict(r._mapping)
+        w.writerow([
+            m["code"], m.get("phone"), m.get("farmer_name"), m.get("farmer_code"),
+            m.get("mandali_name"), m.get("union_code"), m.get("society_code"),
+            m.get("loan_amount"), m.get("channel"), m.get("sms_status"), m.get("status"),
+            _effective_status(m["status"], m.get("expires_at")), _iso(m.get("issued_at")),
+            _iso(m.get("expires_at")), _iso(m.get("redeemed_at")), m.get("redeemed_by"),
+        ])
+    span = f"_{from_}_to_{to}" if (from_ or to) else ""
+    filename = f"loan_codes_{status}{span}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ---------------- codes: clear/cancel active (lets farmer regenerate) --------
 @app.post("/admin/codes/clear")
 async def admin_codes_clear(request: Request):
@@ -1443,6 +1603,9 @@ def _tip_attrs(field: str) -> str:
     return f'tabindex="0" data-tip="{d}" aria-label="{d}"'
 
 
+# How many issued codes the on-screen table shows. The CSV is deliberately not
+# capped — see admin_issued_csv.
+_ISSUED_PAGE = 200
 # The quick-add placeholder states the configured ceiling when there is one, so an
 # operator finds out about the limit before the row is rejected, not after.
 _MAX_LOAN_PLACEHOLDER = (
@@ -1605,6 +1768,36 @@ def render_admin() -> str:
     </section>
 
     <section class="card">
+      <h2 class="section-title">Farmers sent an approval code</h2>
+      <p class="hint">Everyone who has been issued a code, newest first.
+        <strong>Active</strong> = code sent, not yet presented at a branch.
+        <strong>Issued</strong> = the farmer has redeemed it at the bank.
+        The table shows the latest {_ISSUED_PAGE} matches; the CSV contains every match.</p>
+      <form class="search-row" onsubmit="return doIssuedSearch(event)">
+        <input id="issuedQ" class="input" autocomplete="off" placeholder="Phone, name, code, farmer code or mandali">
+        <select id="issuedStatus" class="input" style="flex:0 1 11rem">
+          <option value="all">All statuses</option>
+          <option value="active">Active (not redeemed)</option>
+          <option value="redeemed">Issued at bank</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="expired">Expired</option>
+        </select>
+        <button class="btn btn-outline" type="submit">Search</button>
+      </form>
+      <div class="file-row">
+        <label class="hint" style="margin:0">Sent from <input type="date" id="issuedFrom"></label>
+        <label class="hint" style="margin:0">to <input type="date" id="issuedTo"></label>
+        <button class="btn btn-outline btn-sm" type="button" onclick="doIssuedExport()">Download CSV</button>
+      </div>
+      <div id="issuedCount" class="hint" style="margin-top:.6rem"></div>
+      <div class="table-wrap"><table class="tbl" id="issuedTbl">
+        <thead><tr><th>Name</th><th>Phone</th><th>Code</th><th>Amount</th><th>Status</th>
+          <th>Mandali</th><th>Channel</th><th>SMS</th><th>Sent</th><th>Redeemed</th></tr></thead>
+        <tbody id="issuedBody"><tr><td colspan="10" class="empty">Search to list farmers who have been sent a code.</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section class="card">
       <h2 class="section-title">Clear codes / let a farmer regenerate</h2>
       <p class="hint">Enter a phone to see their codes. <strong>Cancel active</strong> flips active codes to
         <em>cancelled</em> (the record is preserved). This resets the already-availed guard so the farmer can
@@ -1722,6 +1915,59 @@ async function removeElig(phone, name){
     showMsg('Removed '+data.deleted+' row(s) for '+phone+'.', data.deleted?'ok':'info');
     doEligSearch(null);
   }catch(e){ showMsg('Network error.','error'); }
+}
+
+function issuedQuery(){
+  var p=new URLSearchParams();
+  var q=document.getElementById('issuedQ').value.trim();
+  var st=document.getElementById('issuedStatus').value;
+  var f=document.getElementById('issuedFrom').value, t=document.getElementById('issuedTo').value;
+  if(q) p.set('q',q);
+  if(st && st!=='all') p.set('status',st);
+  if(f) p.set('from',f);
+  if(t) p.set('to',t);
+  return p;
+}
+
+async function doIssuedSearch(ev){
+  if(ev) ev.preventDefault();
+  showMsg('','info');
+  var body=document.getElementById('issuedBody');
+  var countEl=document.getElementById('issuedCount');
+  try{
+    var r=await fetch('/admin/api/issued?'+issuedQuery().toString(),{headers:{'Accept':'application/json'}});
+    var data=await r.json();
+    if(!r.ok){ showMsg(data.detail||'Search failed.','error'); return false; }
+    if(!data.rows.length){
+      countEl.textContent='';
+      body.innerHTML='<tr><td colspan="10" class="empty">No farmer has been sent a code matching this.</td></tr>';
+      return false;
+    }
+    // Say plainly when the table is a truncated view, so a partial page is never
+    // mistaken for the whole set.
+    countEl.textContent = data.total>data.count
+      ? ('Showing '+data.count+' of '+data.total+' — narrow the search or download the CSV for all of them.')
+      : (data.total+' farmer'+(data.total===1?'':'s')+' sent a code.');
+    body.innerHTML=data.rows.map(function(c){
+      return '<tr>'
+        + '<td>'+(esc(c.farmer_name)||'—')+'</td>'
+        + '<td class="mono">'+esc(c.phone)+'</td>'
+        + '<td class="mono">'+esc(c.code)+'</td>'
+        + '<td>'+money(c.loan_amount)+'</td>'
+        + '<td>'+badge(c.effective_status)+'</td>'
+        + '<td>'+(esc(c.mandali_name)||'—')+'</td>'
+        + '<td>'+(esc(c.channel)||'—')+'</td>'
+        + '<td>'+(esc(c.sms_status)||'—')+'</td>'
+        + '<td>'+esc(fmtDate(c.issued_at))+'</td>'
+        + '<td>'+esc(fmtDate(c.redeemed_at))+'</td>'
+        + '</tr>';
+    }).join('');
+  }catch(e){ showMsg('Network error.','error'); }
+  return false;
+}
+
+function doIssuedExport(){
+  window.location='/admin/issued.csv?'+issuedQuery().toString();
 }
 
 async function doCodesLookup(ev){
